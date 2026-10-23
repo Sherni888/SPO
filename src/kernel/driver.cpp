@@ -3,7 +3,6 @@
 
 #include <ntddk.h>
 #include <wdm.h>
-#include <ntstrsafe.h>
 #include <ntddscsi.h>
 #include <ntddstor.h>
 
@@ -450,7 +449,14 @@ static NTSTATUS AttachDiskFilter(PDRIVER_OBJECT DriverObject, ULONG diskIdx) {
     if (g_DiskCount >= MAX_DISKS) return STATUS_INSUFFICIENT_RESOURCES;
 
     WCHAR nameBuf[32];
-    RtlStringCchPrintfW(nameBuf, 32, L"\\Device\\Harddisk%lu\\DR0", diskIdx);
+    {
+        static const WCHAR kPfx[] = L"\\Device\\Harddisk";
+        static const WCHAR kSfx[] = L"\\DR0";
+        ULONG pos = 0;
+        for (ULONG k = 0; k < ARRAYSIZE(kPfx) - 1; k++) nameBuf[pos++] = kPfx[k];
+        nameBuf[pos++] = (WCHAR)(L'0' + diskIdx);
+        for (ULONG k = 0; k < ARRAYSIZE(kSfx); k++) nameBuf[pos++] = kSfx[k];
+    }
     UNICODE_STRING devName;
     RtlInitUnicodeString(&devName, nameBuf);
 
