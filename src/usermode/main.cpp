@@ -19,7 +19,10 @@
 #include "spoof_edid.hpp"
 #include "spoof_gpu.hpp"
 
+// ── driver status check ───────────────────────────────────────────────────────
+
 static bool IsDriverLoaded() {
+    // query SCM for our driver service
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) return false;
     SC_HANDLE svc = OpenServiceW(scm, L"spo_drv", SERVICE_QUERY_STATUS);
@@ -28,6 +31,8 @@ static bool IsDriverLoaded() {
     CloseServiceHandle(scm);
     return loaded;
 }
+
+// ── status display ────────────────────────────────────────────────────────────
 
 static void ShowStatus() {
     wprintf(L"\n=== Current Identifiers ===\n\n");
@@ -69,15 +74,19 @@ static void ShowStatus() {
     wprintf(L"\n");
 }
 
+// ── banner ────────────────────────────────────────────────────────────────────
+
 static void PrintBanner() {
     wprintf(
         L"\n"
-        L"  ╔════════════════════════════════════════╗\n"
+        L"  ╔═══════════════════════════════════════╗\n"
         L"  ║   SPO - HWID Spoofer  [Rust/EAC 2026] ║\n"
-        L"  ╚════════════════════════════════════════╝\n"
+        L"  ╚═══════════════════════════════════════╝\n"
         L"\n"
     );
 }
+
+// ── entry ─────────────────────────────────────────────────────────────────────
 
 int wmain(int argc, wchar_t* argv[]) {
     PrintBanner();
@@ -87,6 +96,7 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
+    // parse args
     bool doRestore  = false;
     bool doStatus   = false;
     bool doDriver   = false;
@@ -118,29 +128,36 @@ int wmain(int argc, wchar_t* argv[]) {
         return ok ? 0 : 1;
     }
 
+    // ── spoof mode ────────────────────────────────────────────────────────────
     Backup bk(backupPath);
 
     wprintf(L"[*] Backup target : %s\n", backupPath.c_str());
     wprintf(L"[*] Spoofing identifiers...\n\n");
 
+    // Registry identifiers
     wprintf(L"--- Registry ---\n");
     auto regRes = SpoofRegistryIdentifiers(bk);
 
+    // NIC MACs
     wprintf(L"\n--- Network Adapters ---\n");
     auto nicRes = SpoofNetworkAdapters(bk);
 
+    // EDID
     wprintf(L"\n--- Monitor EDID ---\n");
     auto edidRes = SpoofMonitorEdid(bk);
 
+    // GPU
     wprintf(L"\n--- GPU ---\n");
     auto gpuRes = SpoofGpuIdentifiers(bk);
 
+    // save backup
     wprintf(L"\n--- Backup ---\n");
     if (bk.Save())
         LOGOK(L"Backup saved    -> %s", backupPath.c_str());
     else
         LOGF(L"Backup save failed — restore will not be possible");
 
+    // ── summary ───────────────────────────────────────────────────────────────
     wprintf(L"\n=== Summary ===\n");
     wprintf(L"  Registry spoof : %s\n",
         (regRes.machineGuid && regRes.hwProfileGuid) ? L"OK" : L"partial");
@@ -151,11 +168,17 @@ int wmain(int argc, wchar_t* argv[]) {
         IsDriverLoaded() ? L"LOADED" : L"not loaded — disk serial unpatched");
 
     wprintf(L"\n[i] Reboot before launching Rust.\n");
-    wprintf(L"[i] For disk serial + SMBIOS spoof: loader.exe --load driver\\spo_drv.sys\n");
+    wprintf(L"[i] Disk serial + SMBIOS: loader.exe --load driver\\spo_drv.sys\n");
 
     if (!IsDriverLoaded()) {
-        wprintf(L"\n[!] EAC 2026 reads disk serial at kernel level.\n");
-        wprintf(L"[!] Without the driver, disk serial fingerprint is NOT spoofed.\n");
+        wprintf(L"\n[!] EAC 2026 fingerprint coverage without kernel driver:\n");
+        wprintf(L"    covered  : MachineGuid, HwProfileGuid, ComputerName, InstallDate\n");
+        wprintf(L"             : NIC MACs, EDID serials, GPU IDs\n");
+        wprintf(L"    MISSING  : disk serial (IOCTL_STORAGE_QUERY_PROPERTY)\n");
+        wprintf(L"             : disk ATA serial (IOCTL_ATA_PASS_THROUGH)\n");
+        wprintf(L"             : SMBIOS UUID + baseboard serial\n");
+        wprintf(L"    out-of-scope: TPM EK (requires hypervisor vTPM intercept)\n");
+        wprintf(L"\n[!] loader.exe --load spo_drv.sys --vuln iqvw64e.sys\n");
     }
 
     return 0;
