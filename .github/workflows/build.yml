@@ -57,6 +57,7 @@ jobs:
           $msvcVer  = (Get-ChildItem $msvcBase | Sort-Object Name -Descending | Select-Object -First 1).Name
           $cl       = "$msvcBase\$msvcVer\bin\Hostx64\x64\cl.exe"
           $link     = "$msvcBase\$msvcVer\bin\Hostx64\x64\link.exe"
+          $msvcInc  = "$msvcBase\$msvcVer\include"
 
           $outDir = "$env:GITHUB_WORKSPACE\build\out\bin\Release"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -68,7 +69,7 @@ jobs:
           & $cl /nologo /c /W3 /WX- /O2 /GS- /Gz `
               /D_AMD64_ /DAMD64 /D_WIN64 /DNTDDI_VERSION=0x0A000000 `
               /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DWINNT=1 `
-              /I"$kmInc" /I"$sharedInc" `
+              /I"$kmInc" /I"$sharedInc" /I"$msvcInc" `
               /Fo"$outDir\driver.obj" `
               "src\kernel\driver.cpp"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
