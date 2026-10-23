@@ -26,7 +26,7 @@ jobs:
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
                       [System.Environment]::GetEnvironmentVariable("Path","User")
 
-      # ── usermode: spo.exe + loader.exe via CMake ──────────────────────────────
+      # ── usermode: spo.exe + loader.exe via CMake ───────────────────────────────────────
       - name: Configure CMake
         run: |
           cmake -S build -B build/out -G "Visual Studio 18 2026" -A x64 `
@@ -35,7 +35,7 @@ jobs:
       - name: Build usermode
         run: cmake --build build/out --config Release --parallel
 
-      # ── kernel driver: spo_drv.sys via cl.exe + link.exe directly ────────
+      # ── kernel driver: spo_drv.sys via cl.exe + link.exe directly ────────────
       # WDK toolset include paths don't propagate reliably via msbuild on CI;
       # invoke compiler directly with explicit /I paths found at runtime.
       - name: Build kernel driver
@@ -50,8 +50,14 @@ jobs:
           Write-Host "WDK version: $wdkVer"
 
           $kmInc     = "$kitsBase\Include\$wdkVer\km"
-          $sharedInc = "$kitsBase\Include\$wdkVer\shared"
           $kmLib     = "$kitsBase\Lib\$wdkVer\km\x64"
+
+          # shared headers from the highest SDK version on the runner (base image SDK is complete)
+          $sdkVer    = (Get-ChildItem "$kitsBase\Include" |
+                         Where-Object { $_.Name -match '^\d+\.\d+' } |
+                         Sort-Object Name -Descending |
+                         Select-Object -First 1).Name
+          $sharedInc = "$kitsBase\Include\$sdkVer\shared"
 
           $msvcBase = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC"
           $msvcVer  = (Get-ChildItem $msvcBase | Sort-Object Name -Descending | Select-Object -First 1).Name
@@ -88,7 +94,7 @@ jobs:
               /LIBPATH:"$kmLib" ntoskrnl.lib hal.lib wdm.lib ntstrsafe.lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      # ── zip artifacts ───────────────────────────────────────────────────────
+      # ── zip artifacts ─────────────────────────────────────────────────────────────
       - name: Package release
         shell: powershell
         run: |
@@ -96,7 +102,7 @@ jobs:
           Compress-Archive -Path "$out\spo.exe","$out\loader.exe","$out\spo_drv.sys" `
             -DestinationPath "spo-release-x64.zip" -Force
 
-      # ── upload artifact (always) ──────────────────────────────────────────────
+      # ── upload artifact (always) ──────────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -104,7 +110,7 @@ jobs:
           path: spo-release-x64.zip
           retention-days: 30
 
-      # ── publish GitHub Release ────────────────────────────────────────────────
+      # ── publish GitHub Release ───────────────────────────────────────────────────
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
