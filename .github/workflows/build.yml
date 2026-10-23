@@ -35,14 +35,48 @@ jobs:
       - name: Build usermode
         run: cmake --build build/out --config Release --parallel
 
-      # ── kernel driver: spo_drv.sys via MSBuild + WDK ─────────────────────
+      # ── kernel driver: spo_drv.sys via cl.exe + link.exe directly ────────
+      # WDK toolset include paths don't propagate reliably via msbuild on CI;
+      # invoke compiler directly with explicit /I paths found at runtime.
       - name: Build kernel driver
+        shell: powershell
         run: |
-          msbuild build\kernel\spo_drv.vcxproj `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:OutDir=${{ github.workspace }}\build\out\bin\Release\ `
-            /m /nologo /v:minimal
+          $kitsBase = "C:\Program Files (x86)\Windows Kits\10"
+          $wdkVer   = (Get-ChildItem "$kitsBase\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
+          if (-not $wdkVer) { Write-Error "WDK Include dir not found under $kitsBase"; exit 1 }
+          Write-Host "WDK version: $wdkVer"
+
+          $kmInc     = "$kitsBase\Include\$wdkVer\km"
+          $sharedInc = "$kitsBase\Include\$wdkVer\shared"
+          $kmLib     = "$kitsBase\Lib\$wdkVer\km\x64"
+
+          $msvcBase = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC"
+          $msvcVer  = (Get-ChildItem $msvcBase | Sort-Object Name -Descending | Select-Object -First 1).Name
+          $cl       = "$msvcBase\$msvcVer\bin\Hostx64\x64\cl.exe"
+          $link     = "$msvcBase\$msvcVer\bin\Hostx64\x64\link.exe"
+
+          $outDir = "$env:GITHUB_WORKSPACE\build\out\bin\Release"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          Write-Host "cl: $cl"
+          Write-Host "kmInc: $kmInc"
+          Write-Host "kmLib: $kmLib"
+
+          & $cl /nologo /c /W3 /WX- /O2 /GS- /Gz `
+              /D_AMD64_ /DAMD64 /D_WIN64 /DNTDDI_VERSION=0x0A000000 `
+              /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DWINNT=1 `
+              /I"$kmInc" /I"$sharedInc" `
+              /Fo"$outDir\driver.obj" `
+              "src\kernel\driver.cpp"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $link /nologo /DRIVER /BASE:0x10000 /ALIGN:0x1000 /NODEFAULTLIB `
+              /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 `
+              /OPT:REF /OPT:ICF `
+              /OUT:"$outDir\spo_drv.sys" `
+              "$outDir\driver.obj" `
+              /LIBPATH:"$kmLib" ntoskrnl.lib hal.lib wdm.lib ntstrsafe.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ── zip artifacts ───────────────────────────────────────────────────────
       - name: Package release
