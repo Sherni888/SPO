@@ -10,6 +10,10 @@
 // ── UEFI SMBIOS firmware table class (ntddk.h defines the struct; just the enum value) ──
 #define SystemFirmwareTableInformation 76u
 
+// ZwQuerySystemInformation is in ntifs.h, not ntddk.h — declare manually with ULONG class param
+EXTERN_C NTSTATUS ZwQuerySystemInformation(ULONG SystemInformationClass,
+    PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength);
+
 // ── constants ─────────────────────────────────────────────────────────────────
 
 #define POOL_TAG            'opSX'
@@ -175,7 +179,7 @@ static NTSTATUS OnIoCompletion(PDEVICE_OBJECT DevObj,
         if (code == IOCTL_ATA_PASS_THROUGH) {
             if (outLen >= sizeof(ATA_PASS_THROUGH_EX) + 512) {
                 PATA_PASS_THROUGH_EX apt = (PATA_PASS_THROUGH_EX)outBuf;
-                LONGLONG dbo = apt->DataBufferOffset.QuadPart;
+                LONGLONG dbo = (LONGLONG)apt->DataBufferOffset;
                 if (dbo >= (LONGLONG)sizeof(ATA_PASS_THROUGH_EX) &&
                     dbo + 512 <= (LONGLONG)outLen) {
                     PATA_IDENTIFY_DEVICE_DATA id =
@@ -275,7 +279,6 @@ static BOOLEAN PatchSmbiosStructures(PUCHAR buf, ULONG len) {
                 s++; idx++;
             }
             if (s < strEnd && *s) {
-                // kernel-safe strlen bounded by strEnd
                 SIZE_T origLen = 0;
                 while (origLen < (SIZE_T)(strEnd - s) && s[origLen]) origLen++;
                 if (origLen > 0) {
@@ -340,14 +343,14 @@ static VOID PatchSmbiosUefi(VOID) {
     if (!sfti) return;
 
     sfti->ProviderSignature = 'RSMB';
-    sfti->Action            = 0;
+    sfti->Action            = SystemFirmwareTable_Get;
     sfti->TableID           = 0;
     sfti->TableBufferLength = initSz -
         FIELD_OFFSET(SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer);
 
     ULONG    needed = 0;
     NTSTATUS st = ZwQuerySystemInformation(
-        (SYSTEM_INFORMATION_CLASS)SystemFirmwareTableInformation,
+        SystemFirmwareTableInformation,
         sfti, initSz, &needed);
 
     if (st == STATUS_BUFFER_TOO_SMALL && needed) {
@@ -356,12 +359,12 @@ static VOID PatchSmbiosUefi(VOID) {
             NonPagedPool, needed, POOL_TAG);
         if (!sfti) return;
         sfti->ProviderSignature = 'RSMB';
-        sfti->Action            = 0;
+        sfti->Action            = SystemFirmwareTable_Get;
         sfti->TableID           = 0;
         sfti->TableBufferLength = needed -
             FIELD_OFFSET(SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer);
         st = ZwQuerySystemInformation(
-            (SYSTEM_INFORMATION_CLASS)SystemFirmwareTableInformation,
+            SystemFirmwareTableInformation,
             sfti, needed, &needed);
     }
 
