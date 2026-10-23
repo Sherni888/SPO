@@ -139,9 +139,10 @@ typedef struct _ATA_IDENTIFY_DEVICE_DATA {
 // ── per-disk filter context ───────────────────────────────────────────────────
 
 typedef struct _DISK_FILTER_CTX {
-    PDEVICE_OBJECT FilterDevice;       // our filter device (for DriverUnload)
+    PDEVICE_OBJECT FilterDevice;          // our filter device (for DriverUnload)
     PDEVICE_OBJECT LowerDevice;
-    CHAR           SpoofedSerial[24];  // assigned at attach time
+    CHAR           SpoofedSerial[24];     // plain ascii — STORAGE_QUERY_PROPERTY / SCSI VPD
+    CHAR           SpoofedSerialAta[20];  // byte-swapped per word — ATA IDENTIFY (words 10-19)
     BOOL           Active;
 } DISK_FILTER_CTX, *PDISK_FILTER_CTX;
 
@@ -232,15 +233,17 @@ static NTSTATUS OnIoCompletion(PDEVICE_OBJECT DevObj,
             PatchStorageDescriptor(outBuf, outLen, ctx);
 
         // ATA PASS THROUGH — patch word 10-19 (serial in IDENTIFY response)
-        if (code == IOCTL_ATA_PASS_THROUGH || code == IOCTL_ATA_PASS_THROUGH_DIRECT) {
+        if (code == IOCTL_ATA_PASS_THROUGH) {
             if (outLen >= sizeof(ATA_PASS_THROUGH_EX) + 512) {
-                // data follows the passthrough struct
-                ULONG offset = sizeof(ATA_PASS_THROUGH_EX);
-                PATA_IDENTIFY_DEVICE_DATA id =
-                    (PATA_IDENTIFY_DEVICE_DATA)(outBuf + offset);
-                CHAR ata[21];
-                MakeAtaSerial(ata, 21);
-                RtlCopyMemory(id->SerialNumber, ata, 20);
+                PATA_PASS_THROUGH_EX apt = (PATA_PASS_THROUGH_EX)outBuf;
+                LONGLONG dbo = apt->DataBufferOffset.QuadPart;
+                if (dbo >= (LONGLONG)sizeof(ATA_PASS_THROUGH_EX) &&
+                    dbo + 512 <= (LONGLONG)outLen) {
+                    PATA_IDENTIFY_DEVICE_DATA id =
+                        (PATA_IDENTIFY_DEVICE_DATA)(outBuf + dbo);
+                    // use precomputed per-disk byte-swapped serial for consistency
+                    RtlCopyMemory(id->SerialNumber, ctx->SpoofedSerialAta, 20);
+                }
             }
         }
 
@@ -262,9 +265,10 @@ static NTSTATUS OnIoCompletion(PDEVICE_OBJECT DevObj,
                     ULONG  pgLen  = data[3];
                     ULONG  avail  = (ULONG)(outLen - dbo - 4);
                     if (pgLen > 0 && pgLen <= avail && pgLen < 24) {
-                        CHAR ns[25] = { 0 };
-                        MakeSerial(ns, pgLen + 1);
-                        RtlCopyMemory(data + 4, ns, pgLen);
+                        // use per-disk stored serial for cross-path consistency
+                        ULONG copyLen = min(pgLen,
+                            (ULONG)(sizeof(ctx->SpoofedSerial) - 1));
+                        RtlCopyMemory(data + 4, ctx->SpoofedSerial, copyLen);
                     }
                 }
             }
@@ -284,8 +288,10 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp) {
     ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
 
     if (code == IOCTL_STORAGE_QUERY_PROPERTY ||
-        code == IOCTL_ATA_PASS_THROUGH        ||
-        code == IOCTL_ATA_PASS_THROUGH_DIRECT) {
+        code == IOCTL_ATA_PASS_THROUGH        ||  // METHOD_BUFFERED — safe to patch in completion
+        code == IOCTL_SCSI_PASS_THROUGH) {
+        // IOCTL_ATA_PASS_THROUGH_DIRECT uses METHOD_NEITHER; its output lives in
+        // Irp->UserBuffer (user address), not SystemBuffer — skip to avoid fault.
         IoCopyCurrentIrpStackLocationToNext(Irp);
         IoSetCompletionRoutine(Irp, OnIoCompletion, ctx, TRUE, TRUE, TRUE);
         return IoCallDriver(ctx->LowerDevice, Irp);
@@ -463,6 +469,7 @@ static NTSTATUS AttachDiskFilter(PDRIVER_OBJECT DriverObject, ULONG diskIdx) {
 
     ctx->FilterDevice = filterDev;
     MakeSerial(ctx->SpoofedSerial, sizeof(ctx->SpoofedSerial));
+    MakeAtaSerial(ctx->SpoofedSerialAta, sizeof(ctx->SpoofedSerialAta));
     ctx->Active = TRUE;
     g_Disks[idx] = *ctx;
 
