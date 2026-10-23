@@ -42,8 +42,11 @@ jobs:
         shell: powershell
         run: |
           $kitsBase = "C:\Program Files (x86)\Windows Kits\10"
-          $wdkVer   = (Get-ChildItem "$kitsBase\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
-          if (-not $wdkVer) { Write-Error "WDK Include dir not found under $kitsBase"; exit 1 }
+          $wdkVer   = (Get-ChildItem "$kitsBase\Include" |
+                        Where-Object { $_.Name -match '^\d+\.\d+' } |
+                        Sort-Object Name -Descending |
+                        Select-Object -First 1).Name
+          if (-not $wdkVer) { Write-Error "WDK versioned Include dir not found under $kitsBase\Include"; exit 1 }
           Write-Host "WDK version: $wdkVer"
 
           $kmInc     = "$kitsBase\Include\$wdkVer\km"
