@@ -13,6 +13,32 @@
 #include <ntstrsafe.h>
 #include <ntddscsi.h>
 
+// ── UEFI SMBIOS / firmware table declarations ─────────────────────────────────
+
+#define SystemFirmwareTableInformation 76u
+
+typedef struct _SYSTEM_FIRMWARE_TABLE_INFORMATION {
+    ULONG ProviderSignature;  // 'RSMB' = 0x52534D42
+    ULONG Action;             // 0 = Get
+    ULONG TableID;
+    ULONG TableBufferLength;  // [in] buffer size; [out] bytes written
+    UCHAR TableBuffer[1];
+} SYSTEM_FIRMWARE_TABLE_INFORMATION, *PSYSTEM_FIRMWARE_TABLE_INFORMATION;
+
+extern NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
+    ULONG  SystemInformationClass,
+    PVOID  SystemInformation,
+    ULONG  SystemInformationLength,
+    PULONG ReturnLength);
+
+// MmGetPhysicalMemoryRanges: ntoskrnl export; caller frees result with ExFreePool
+typedef struct _PHYSICAL_MEMORY_RANGE {
+    PHYSICAL_ADDRESS BaseAddress;
+    LARGE_INTEGER    NumberOfBytes;
+} PHYSICAL_MEMORY_RANGE, *PPHYSICAL_MEMORY_RANGE;
+
+extern NTKERNELAPI PPHYSICAL_MEMORY_RANGE MmGetPhysicalMemoryRanges(VOID);
+
 // ── constants ─────────────────────────────────────────────────────────────────
 
 #define POOL_TAG            'opSX'
@@ -311,121 +337,207 @@ static NTSTATUS DispatchPassthrough(PDEVICE_OBJECT DevObj, PIRP Irp) {
 
 // ── SMBIOS patch ──────────────────────────────────────────────────────────────
 
-static UCHAR SmBiosChecksum(PUCHAR buf, SIZE_T len) {
-    UCHAR sum = 0;
-    for (SIZE_T i = 0; i < len; i++) sum += buf[i];
-    return sum;
-}
+// Walk and patch Type1 UUID + Type2 baseboard serial in an SMBIOS structure
+// table at buf[0..len).  Returns TRUE if at least one structure was patched.
+static BOOL PatchSmbiosStructures(PUCHAR buf, ULONG len) {
+    PUCHAR cur = buf;
+    PUCHAR end = buf + len;
+    BOOL   p1  = FALSE, p2 = FALSE;
 
-static VOID PatchSmbios(VOID) {
-    // locate SMBIOS via firmware table — we use ACPI physical address scan
-    // Windows caches the SMBIOS table; MmGetSystemAddressForMdlSafe gives us access
-    //
-    // SMBIOS entry point lives in physical memory 0xF0000 - 0xFFFFF (legacy)
-    // or in ACPI firmware table (EFI systems: via EFI_SMBIOS_PROTOCOL)
-    // We map both regions and scan for "_SM_" signature
-
-    const PHYSICAL_ADDRESS phyStart = { 0xF0000, 0 };
-    const SIZE_T           scanSize  = 0x10000;  // 64KB
-
-    PVOID mapped = MmMapIoSpace(phyStart, scanSize, MmNonCached);
-    if (!mapped) {
-        KdPrint(("[spo] SMBIOS scan: MmMapIoSpace failed\n"));
-        return;
-    }
-
-    PSMBIOS_ENTRY_POINT_21 ep = NULL;
-    for (SIZE_T off = 0; off + sizeof(SMBIOS_ENTRY_POINT_21) < scanSize; off += 16) {
-        PUCHAR p = (PUCHAR)mapped + off;
-        if (p[0] == '_' && p[1] == 'S' && p[2] == 'M' && p[3] == '_') {
-            ep = (PSMBIOS_ENTRY_POINT_21)p;
-            break;
-        }
-    }
-
-    if (!ep) {
-        KdPrint(("[spo] SMBIOS entry point not found in 0xF0000 region\n"));
-        MmUnmapIoSpace(mapped, scanSize);
-        return;
-    }
-
-    KdPrint(("[spo] SMBIOS entry at +0x%llx, table at phys 0x%X len %u\n",
-        (ULONG_PTR)ep - (ULONG_PTR)mapped,
-        ep->StructureTableAddress, ep->StructureTableLength));
-
-    // map the SMBIOS structure table
-    PHYSICAL_ADDRESS tablePhys;
-    tablePhys.QuadPart = ep->StructureTableAddress;
-    PVOID table = MmMapIoSpace(tablePhys,
-        ep->StructureTableLength + 8, MmNonCached);
-    if (!table) {
-        MmUnmapIoSpace(mapped, scanSize);
-        return;
-    }
-
-    // walk the structure table
-    PUCHAR cur = (PUCHAR)table;
-    PUCHAR end = cur + ep->StructureTableLength;
-    BOOL   patchedType1 = FALSE;
-    BOOL   patchedType2 = FALSE;
-
-    while (cur < end) {
+    while (cur + sizeof(SMBIOS_HEADER) < end) {
         PSMBIOS_HEADER hdr = (PSMBIOS_HEADER)cur;
-        if (hdr->Type == 127) break;  // end-of-table marker
+        if (hdr->Type == 127) break;
 
-        if (hdr->Type == 1 && hdr->Length >= sizeof(SMBIOS_TYPE1) && !patchedType1) {
+        if (hdr->Type == 1 && hdr->Length >= sizeof(SMBIOS_TYPE1) && !p1) {
             PSMBIOS_TYPE1 t1 = (PSMBIOS_TYPE1)cur;
-            // randomize UUID bytes (avoid RFC4122 version/variant bits — some EAC
-            // checks use the UUID version; keep version byte intact at b[6] & 0xF0)
             for (int i = 0; i < 16; i++) {
-                if (i == 6) t1->UUID[i] = (t1->UUID[i] & 0xF0) | (RandByteK() & 0x0F);
+                if      (i == 6) t1->UUID[i] = (t1->UUID[i] & 0xF0) | (RandByteK() & 0x0F);
                 else if (i == 8) t1->UUID[i] = (t1->UUID[i] & 0x3F) | 0x80;
-                else t1->UUID[i] = RandByteK();
+                else             t1->UUID[i] = RandByteK();
             }
-            patchedType1 = TRUE;
+            p1 = TRUE;
             KdPrint(("[spo] SMBIOS Type1 UUID patched\n"));
         }
 
-        if (hdr->Type == 2 && hdr->Length >= sizeof(SMBIOS_TYPE2) && !patchedType2) {
-            PSMBIOS_TYPE2 t2 = (PSMBIOS_TYPE2)cur;
-            // the serial number is a 1-based index into the string table
-            // string table follows the formatted area
-            PCHAR strTable = (PCHAR)(cur + hdr->Length);
-            PCHAR strEnd   = (PCHAR)end;
-
-            // walk to the SerialNumber-th string
-            PCHAR s = strTable;
-            int   idx = 1;
+        if (hdr->Type == 2 && hdr->Length >= sizeof(SMBIOS_TYPE2) && !p2) {
+            PSMBIOS_TYPE2 t2    = (PSMBIOS_TYPE2)cur;
+            PCHAR         strTbl = (PCHAR)(cur + hdr->Length);
+            PCHAR         strEnd = (PCHAR)end;
+            PCHAR         s     = strTbl;
+            int           idx   = 1;
             while (idx < t2->SerialNumber && s < strEnd) {
                 while (*s && s < strEnd) s++;
-                s++;  // skip null
-                idx++;
+                s++; idx++;
             }
             if (s < strEnd && *s) {
-                // overwrite in place — same length to avoid table corruption
                 SIZE_T origLen = strnlen(s, (SIZE_T)(strEnd - s));
                 if (origLen > 0) {
-                    CHAR newSerial[24] = { 0 };
-                    MakeSerial(newSerial, min(origLen + 1, sizeof(newSerial)));
-                    RtlCopyMemory(s, newSerial, origLen);
-                    patchedType2 = TRUE;
+                    CHAR newSer[24] = { 0 };
+                    MakeSerial(newSer, min(origLen + 1, sizeof(newSer)));
+                    RtlCopyMemory(s, newSer, origLen);
+                    p2 = TRUE;
                     KdPrint(("[spo] SMBIOS Type2 baseboard serial patched\n"));
                 }
             }
         }
 
-        // advance to next structure: skip formatted area + string table
         cur += hdr->Length;
-        // skip string table (double-null terminated)
         while (cur + 1 < end) {
             if (cur[0] == 0 && cur[1] == 0) { cur += 2; break; }
             while (*cur && cur < end) cur++;
             cur++;
         }
     }
+    return (p1 || p2);
+}
 
-    MmUnmapIoSpace(table, ep->StructureTableLength + 8);
+// Legacy path: physical scan at 0xF0000 (BIOS / CSM / most OEM UEFI).
+// Returns TRUE if entry point found and table patched.
+static BOOL PatchSmbios(VOID) {
+    const PHYSICAL_ADDRESS phyStart = { 0xF0000, 0 };
+    const SIZE_T           scanSize  = 0x10000;
+
+    PVOID mapped = MmMapIoSpace(phyStart, scanSize, MmNonCached);
+    if (!mapped) { KdPrint(("[spo] SMBIOS legacy: MmMapIoSpace failed\n")); return FALSE; }
+
+    PSMBIOS_ENTRY_POINT_21 ep = NULL;
+    for (SIZE_T off = 0; off + sizeof(SMBIOS_ENTRY_POINT_21) < scanSize; off += 16) {
+        PUCHAR p = (PUCHAR)mapped + off;
+        if (p[0] == '_' && p[1] == 'S' && p[2] == 'M' && p[3] == '_') {
+            ep = (PSMBIOS_ENTRY_POINT_21)p; break;
+        }
+    }
+    if (!ep) {
+        KdPrint(("[spo] SMBIOS legacy: entry point not found\n"));
+        MmUnmapIoSpace(mapped, scanSize);
+        return FALSE;
+    }
+
+    PHYSICAL_ADDRESS tblPhys;
+    tblPhys.QuadPart = ep->StructureTableAddress;
+    ULONG tblLen = ep->StructureTableLength;
     MmUnmapIoSpace(mapped, scanSize);
+
+    PVOID table = MmMapIoSpace(tblPhys, tblLen + 8, MmNonCached);
+    if (!table) { KdPrint(("[spo] SMBIOS legacy: table map failed\n")); return FALSE; }
+
+    BOOL ok = PatchSmbiosStructures((PUCHAR)table, tblLen);
+    MmUnmapIoSpace(table, tblLen + 8);
+    if (ok) KdPrint(("[spo] SMBIOS legacy: OK\n"));
+    return ok;
+}
+
+// UEFI path: ZwQuerySystemInformation('RSMB') returns the live kernel cache.
+// We use the Type1 UUID as a fingerprint, then scan physical memory ranges
+// (<= 4 GB) for the matching bytes and patch the firmware table in place.
+static VOID PatchSmbiosUefi(VOID) {
+    // ── step 1: get raw SMBIOS bytes from kernel ──────────────────────────────
+    const ULONG initSz = sizeof(SYSTEM_FIRMWARE_TABLE_INFORMATION) + 0x8000;
+    PSYSTEM_FIRMWARE_TABLE_INFORMATION sfti =
+        (PSYSTEM_FIRMWARE_TABLE_INFORMATION)ExAllocatePoolWithTag(
+            NonPagedPool, initSz, POOL_TAG);
+    if (!sfti) return;
+
+    sfti->ProviderSignature = 'RSMB';
+    sfti->Action            = 0;
+    sfti->TableID           = 0;
+    sfti->TableBufferLength = initSz -
+        FIELD_OFFSET(SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer);
+
+    ULONG    needed = 0;
+    NTSTATUS st = ZwQuerySystemInformation(
+        SystemFirmwareTableInformation, sfti, initSz, &needed);
+
+    if (st == STATUS_BUFFER_TOO_SMALL && needed) {
+        ExFreePoolWithTag(sfti, POOL_TAG);
+        sfti = (PSYSTEM_FIRMWARE_TABLE_INFORMATION)ExAllocatePoolWithTag(
+            NonPagedPool, needed, POOL_TAG);
+        if (!sfti) return;
+        sfti->ProviderSignature = 'RSMB';
+        sfti->Action            = 0;
+        sfti->TableID           = 0;
+        sfti->TableBufferLength = needed -
+            FIELD_OFFSET(SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer);
+        st = ZwQuerySystemInformation(
+            SystemFirmwareTableInformation, sfti, needed, &needed);
+    }
+
+    if (!NT_SUCCESS(st) || sfti->TableBufferLength < 9) {
+        KdPrint(("[spo] ZwQSI RSMB: 0x%X\n", st));
+        ExFreePoolWithTag(sfti, POOL_TAG);
+        return;
+    }
+
+    // RSMB raw layout: 1+1+1+1 (method/maj/min/dmi) + DWORD length + data
+    ULONG  smbLen  = *(ULONG*)(sfti->TableBuffer + 4);
+    PUCHAR smbData = sfti->TableBuffer + 8;
+    if (smbLen + 8 > sfti->TableBufferLength)
+        smbLen = sfti->TableBufferLength - 8;
+
+    // ── step 2: extract Type1 UUID as fingerprint ────────────────────────────
+    UCHAR  uuid[16] = { 0 };
+    BOOL   gotUuid  = FALSE;
+    PUCHAR c = smbData, e = smbData + smbLen;
+    while (c + sizeof(SMBIOS_HEADER) < e && !gotUuid) {
+        PSMBIOS_HEADER h = (PSMBIOS_HEADER)c;
+        if (h->Type == 127) break;
+        if (h->Type == 1 && h->Length >= sizeof(SMBIOS_TYPE1)) {
+            RtlCopyMemory(uuid, ((PSMBIOS_TYPE1)c)->UUID, 16);
+            gotUuid = TRUE;
+        }
+        c += h->Length;
+        while (c + 1 < e) {
+            if (c[0] == 0 && c[1] == 0) { c += 2; break; }
+            while (*c && c < e) c++;
+            c++;
+        }
+    }
+    ExFreePoolWithTag(sfti, POOL_TAG);
+
+    if (!gotUuid) { KdPrint(("[spo] RSMB UEFI: no Type1\n")); return; }
+
+    // ── step 3: scan physical ranges <= 4 GB for the UUID fingerprint ─────────
+    PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
+    if (!ranges) return;
+
+    BOOL patched = FALSE;
+    for (int r = 0; ranges[r].NumberOfBytes.QuadPart != 0 && !patched; r++) {
+        ULONG64 base = (ULONG64)ranges[r].BaseAddress.QuadPart;
+        ULONG64 span = (ULONG64)ranges[r].NumberOfBytes.QuadPart;
+        if (base >= 0x100000000ULL) continue;               // above 4 GB — skip
+        if (base + span > 0x100000000ULL)
+            span = 0x100000000ULL - base;
+
+        for (ULONG64 off = 0; off < span && !patched; off += 0x10000) {
+            ULONG64 chunk = min(span - off, 0x10000ULL);
+            PHYSICAL_ADDRESS pa;
+            pa.QuadPart = (LONGLONG)(base + off);
+            PVOID m = MmMapIoSpace(pa, (SIZE_T)chunk, MmNonCached);
+            if (!m) continue;
+
+            PUCHAR p = (PUCHAR)m;
+            for (SIZE_T i = 0; i + sizeof(SMBIOS_TYPE1) <= chunk && !patched; i++) {
+                PSMBIOS_HEADER hdr = (PSMBIOS_HEADER)(p + i);
+                if (hdr->Type == 1 && hdr->Length >= sizeof(SMBIOS_TYPE1)) {
+                    PSMBIOS_TYPE1 t1 = (PSMBIOS_TYPE1)(p + i);
+                    if (RtlCompareMemory(t1->UUID, uuid, 16) == 16) {
+                        for (int k = 0; k < 16; k++) {
+                            if      (k == 6) t1->UUID[k] = (t1->UUID[k] & 0xF0) | (RandByteK() & 0x0F);
+                            else if (k == 8) t1->UUID[k] = (t1->UUID[k] & 0x3F) | 0x80;
+                            else             t1->UUID[k] = RandByteK();
+                        }
+                        patched = TRUE;
+                        KdPrint(("[spo] SMBIOS UEFI: UUID patched at phys 0x%llx\n",
+                            base + off + i));
+                    }
+                }
+            }
+            MmUnmapIoSpace(m, (SIZE_T)chunk);
+        }
+    }
+    ExFreePool(ranges);
+    if (!patched) KdPrint(("[spo] SMBIOS UEFI: fingerprint not found\n"));
+    else          KdPrint(("[spo] SMBIOS UEFI: OK\n"));
 }
 
 // ── attach filter to disk device ─────────────────────────────────────────────
@@ -525,8 +637,9 @@ EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject,
     }
     KdPrint(("[spo] disk filters: %d attached\n", attached));
 
-    // patch SMBIOS in physical memory
-    PatchSmbios();
+    // patch SMBIOS — legacy path first (BIOS/CSM), UEFI fallback if not found
+    if (!PatchSmbios())
+        PatchSmbiosUefi();
 
     KdPrint(("[spo] driver loaded OK\n"));
     return STATUS_SUCCESS;

@@ -22,6 +22,8 @@
 //   loader.exe --load spo_drv.sys --scm                  SCM (signed/test-sign)
 //   loader.exe --unload
 //   loader.exe --status
+//   loader.exe --install   [--vuln iqvw64e.sys]          persist via schtask
+//   loader.exe --uninstall                               remove schtask
 
 #include <windows.h>
 #include <winternl.h>
@@ -459,6 +461,74 @@ static bool ManualMapDriver(const std::wstring& vulnPath,
     return true;
 }
 
+// ── scheduled-task install helpers ───────────────────────────────────────────
+
+// Returns directory of the current executable (no trailing backslash).
+static std::wstring GetLoaderDir() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* last = wcsrchr(path, L'\\');
+    if (last) *last = L'\0';
+    return path;
+}
+
+// Run a detached process and wait for it; returns its exit code or ~0u on failure.
+static DWORD RunProcess(const std::wstring& cmd) {
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    // CreateProcessW needs a mutable buffer
+    std::wstring buf = cmd;
+    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr,
+            FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+        return ~0u;
+    WaitForSingleObject(pi.hProcess, 10000);
+    DWORD ec = ~0u;
+    GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return ec;
+}
+
+static constexpr wchar_t k_TaskName[] = L"SpoInit";
+
+// Create a scheduled task that runs loader + driver at every system start as SYSTEM.
+static bool InstallTask(const std::wstring& loaderDir,
+                        const std::wstring& driverFile,
+                        const std::wstring& vulnFile) {
+    // Resolve absolute paths
+    wchar_t loaderAbs[MAX_PATH], driverAbs[MAX_PATH], vulnAbs[MAX_PATH];
+    GetFullPathNameW((loaderDir + L"\\loader.exe").c_str(), MAX_PATH, loaderAbs, nullptr);
+    GetFullPathNameW(driverFile.c_str(),                    MAX_PATH, driverAbs, nullptr);
+    GetFullPathNameW(vulnFile.c_str(),                      MAX_PATH, vulnAbs,   nullptr);
+
+    // schtasks /create /tn SpoInit /tr "loader.exe --load ... --vuln ..." /sc ONSTART
+    //          /ru SYSTEM /rl HIGHEST /f
+    std::wstring tr = std::wstring(L"\"") + loaderAbs + L"\" --load \"" +
+                      driverAbs + L"\" --vuln \"" + vulnAbs + L"\"";
+    std::wstring cmd =
+        std::wstring(L"schtasks.exe /create /tn \"") + k_TaskName + L"\" /tr \"" +
+        tr + L"\" /sc ONSTART /ru SYSTEM /rl HIGHEST /f";
+
+    DWORD ec = RunProcess(cmd);
+    if (ec == 0) {
+        wprintf(L"[+] scheduled task '%s' created\n", k_TaskName);
+        wprintf(L"[i] runs at boot as SYSTEM: %s\n", tr.c_str());
+        return true;
+    }
+    wprintf(L"[-] schtasks /create failed (exit %u)\n", ec);
+    return false;
+}
+
+static bool UninstallTask() {
+    std::wstring cmd =
+        std::wstring(L"schtasks.exe /delete /tn \"") + k_TaskName + L"\" /f";
+    DWORD ec = RunProcess(cmd);
+    if (ec == 0) { wprintf(L"[+] scheduled task '%s' removed\n", k_TaskName); return true; }
+    wprintf(L"[-] schtasks /delete failed (exit %u) — task may not exist\n", ec);
+    return false;
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 static constexpr wchar_t k_SpoSvc[] = L"spo_drv";
@@ -468,32 +538,59 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (!ResolveNtdll()) return 1;
 
-    bool         doLoad   = false;
-    bool         doUnload = false;
-    bool         doStatus = false;
-    bool         useScm   = false;
+    bool         doLoad      = false;
+    bool         doUnload    = false;
+    bool         doStatus    = false;
+    bool         useScm      = false;
+    bool         doInstall   = false;
+    bool         doUninstall = false;
     std::wstring driverPath;
     std::wstring vulnPath = L"iqvw64e.sys"; // default: same dir as loader.exe
 
     for (int i = 1; i < argc; i++) {
         const std::wstring arg = argv[i];
-        if      (arg == L"--load"   && i + 1 < argc) { doLoad = true;  driverPath = argv[++i]; }
-        else if (arg == L"--unload")                   doUnload = true;
-        else if (arg == L"--status")                   doStatus = true;
-        else if (arg == L"--scm")                      useScm   = true;
-        else if (arg == L"--vuln"   && i + 1 < argc)  vulnPath = argv[++i];
+        if      (arg == L"--load"      && i + 1 < argc) { doLoad = true;  driverPath = argv[++i]; }
+        else if (arg == L"--unload")                      doUnload    = true;
+        else if (arg == L"--status")                      doStatus    = true;
+        else if (arg == L"--scm")                         useScm      = true;
+        else if (arg == L"--vuln"      && i + 1 < argc)  vulnPath    = argv[++i];
+        else if (arg == L"--install")                     doInstall   = true;
+        else if (arg == L"--uninstall")                   doUninstall = true;
     }
 
-    if (!doLoad && !doUnload && !doStatus) {
+    if (!doLoad && !doUnload && !doStatus && !doInstall && !doUninstall) {
         wprintf(
             L"Usage:\n"
             L"  loader.exe --load <spo_drv.sys> [--vuln <iqvw64e.sys>]  unsigned map\n"
             L"  loader.exe --load <spo_drv.sys> --scm                    signed / test-mode\n"
             L"  loader.exe --unload\n"
-            L"  loader.exe --status\n\n"
+            L"  loader.exe --status\n"
+            L"  loader.exe --install   [--vuln <iqvw64e.sys>]            persist via schtask\n"
+            L"  loader.exe --uninstall                                    remove schtask\n\n"
             L"  Default --vuln path: iqvw64e.sys (same directory as loader.exe)\n"
         );
         return 0;
+    }
+
+    // ── install / uninstall (no privilege check needed for schtasks itself) ───
+    if (doUninstall) {
+        UninstallTask();
+        return 0;
+    }
+
+    if (doInstall) {
+        const std::wstring dir = GetLoaderDir();
+        // driver defaults to loader dir if not given
+        const std::wstring drv = driverPath.empty()
+            ? dir + L"\\spo_drv.sys" : driverPath;
+        const std::wstring vuln = (vulnPath == L"iqvw64e.sys")
+            ? dir + L"\\iqvw64e.sys" : vulnPath;
+        bool ok = InstallTask(dir, drv, vuln);
+        if (ok) {
+            wprintf(L"[i] Driver loads automatically on next reboot.\n");
+            wprintf(L"[i] To remove: loader.exe --uninstall\n");
+        }
+        return ok ? 0 : 1;
     }
 
     if (doStatus) {
