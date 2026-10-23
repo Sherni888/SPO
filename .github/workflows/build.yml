@@ -62,9 +62,15 @@ jobs:
           $outDir = "$env:GITHUB_WORKSPACE\build\out\bin\Release"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-          Write-Host "cl: $cl"
-          Write-Host "kmInc: $kmInc"
-          Write-Host "kmLib: $kmLib"
+          Write-Host "cl:        $cl"
+          Write-Host "kmInc:     $kmInc"
+          Write-Host "sharedInc: $sharedInc"
+          Write-Host "msvcInc:   $msvcInc"
+          Write-Host "kmLib:     $kmLib"
+          Write-Host "ntdef.h exists: $(Test-Path "$sharedInc\ntdef.h")"
+
+          # Set INCLUDE env var — more reliable for deep include chains than /I alone
+          $env:INCLUDE = "$msvcInc;$kmInc;$sharedInc"
 
           & $cl /nologo /c /W3 /WX- /O2 /GS- /Gz `
               /D_AMD64_ /DAMD64 /D_WIN64 /DNTDDI_VERSION=0x0A000000 `
