@@ -1,68 +1,25 @@
 // language: C++/WDK, file: driver.cpp, target: Windows 11 x64 kernel mode
 // SPO kernel driver — disk serial spoof + SMBIOS UUID patch
-//
-// Build: WDK 11 (wdk-build 10.0.26100.x), MSVC 17.x
-//   Properties -> Driver Settings -> Target OS = Windows 10 / 11
-//   Code Analysis -> yes for release builds
-//
-// Loading: requires kdmapper (gdrv.sys / physmem mapper) OR EV-signed cert
-//   loader.exe --load spo_drv.sys
 
 #include <ntddk.h>
 #include <wdm.h>
 #include <ntstrsafe.h>
 #include <ntddscsi.h>
+#include <ntddstor.h>
 
-// ── UEFI SMBIOS / firmware table declarations ─────────────────────────────────
-
+// ── UEFI SMBIOS firmware table class (ntddk.h defines the struct; just the enum value) ──
 #define SystemFirmwareTableInformation 76u
-
-typedef struct _SYSTEM_FIRMWARE_TABLE_INFORMATION {
-    ULONG ProviderSignature;  // 'RSMB' = 0x52534D42
-    ULONG Action;             // 0 = Get
-    ULONG TableID;
-    ULONG TableBufferLength;  // [in] buffer size; [out] bytes written
-    UCHAR TableBuffer[1];
-} SYSTEM_FIRMWARE_TABLE_INFORMATION, *PSYSTEM_FIRMWARE_TABLE_INFORMATION;
-
-extern NTSYSAPI NTSTATUS NTAPI ZwQuerySystemInformation(
-    ULONG  SystemInformationClass,
-    PVOID  SystemInformation,
-    ULONG  SystemInformationLength,
-    PULONG ReturnLength);
-
-// MmGetPhysicalMemoryRanges: ntoskrnl export; caller frees result with ExFreePool
-typedef struct _PHYSICAL_MEMORY_RANGE {
-    PHYSICAL_ADDRESS BaseAddress;
-    LARGE_INTEGER    NumberOfBytes;
-} PHYSICAL_MEMORY_RANGE, *PPHYSICAL_MEMORY_RANGE;
-
-extern NTKERNELAPI PPHYSICAL_MEMORY_RANGE MmGetPhysicalMemoryRanges(VOID);
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
 #define POOL_TAG            'opSX'
 #define MAX_DISKS           8
 
-// IOCTL we intercept
-#define IOCTL_STORAGE_QUERY_PROPERTY \
-    CTL_CODE(IOCTL_STORAGE_BASE, 0x0500, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-// SCSI passthrough (direct ATA identify — EAC secondary path)
-#define IOCTL_ATA_PASS_THROUGH \
-    CTL_CODE(IOCTL_SCSI_BASE, 0x040B, METHOD_BUFFERED, FILE_READ_WRITE_DATA)
-
-#define IOCTL_ATA_PASS_THROUGH_DIRECT \
-    CTL_CODE(IOCTL_SCSI_BASE, 0x040C, METHOD_NEITHER, FILE_READ_WRITE_DATA)
-
-#define IOCTL_SCSI_PASS_THROUGH \
-    CTL_CODE(IOCTL_SCSI_BASE, 0x0401, METHOD_BUFFERED, FILE_READ_WRITE_DATA)
-
 // ── SMBIOS structures ─────────────────────────────────────────────────────────
 
 #pragma pack(push, 1)
 typedef struct _SMBIOS_ENTRY_POINT_21 {
-    CHAR   Signature[4];   // "_SM_"
+    CHAR   Signature[4];
     UINT8  Checksum;
     UINT8  Length;
     UINT8  MajorVersion;
@@ -70,7 +27,7 @@ typedef struct _SMBIOS_ENTRY_POINT_21 {
     UINT16 MaxStructureSize;
     UINT8  EntryPointRevision;
     UINT8  FormattedArea[5];
-    CHAR   IntermediateAnchor[5]; // "_DMI_"
+    CHAR   IntermediateAnchor[5];
     UINT8  IntermediateChecksum;
     UINT16 StructureTableLength;
     UINT32 StructureTableAddress;
@@ -84,26 +41,24 @@ typedef struct _SMBIOS_HEADER {
     UINT16 Handle;
 } SMBIOS_HEADER, *PSMBIOS_HEADER;
 
-// Type 1 — System Information
 typedef struct _SMBIOS_TYPE1 {
     SMBIOS_HEADER  Header;
     UINT8          Manufacturer;
     UINT8          ProductName;
     UINT8          Version;
     UINT8          SerialNumber;
-    UINT8          UUID[16];   // <- patch target
+    UINT8          UUID[16];
     UINT8          WakeUpType;
     UINT8          SKUNumber;
     UINT8          Family;
 } SMBIOS_TYPE1, *PSMBIOS_TYPE1;
 
-// Type 2 — Baseboard
 typedef struct _SMBIOS_TYPE2 {
     SMBIOS_HEADER  Header;
     UINT8          Manufacturer;
     UINT8          Product;
     UINT8          Version;
-    UINT8          SerialNumber;  // string index -> patch the string table
+    UINT8          SerialNumber;
     UINT8          AssetTag;
     UINT8          FeatureFlags;
     UINT8          LocationInChassis;
@@ -113,63 +68,27 @@ typedef struct _SMBIOS_TYPE2 {
 } SMBIOS_TYPE2, *PSMBIOS_TYPE2;
 #pragma pack(pop)
 
-// ── storage descriptor layout ─────────────────────────────────────────────────
-
-#pragma pack(push, 1)
-typedef struct _STORAGE_DEVICE_DESCRIPTOR {
-    ULONG  Version;
-    ULONG  Size;
-    UCHAR  DeviceType;
-    UCHAR  DeviceTypeModifier;
-    BOOLEAN RemovableMedia;
-    BOOLEAN CommandQueueing;
-    ULONG  VendorIdOffset;
-    ULONG  ProductIdOffset;
-    ULONG  ProductRevisionOffset;
-    ULONG  SerialNumberOffset;
-    ULONG  BusType;
-    ULONG  RawPropertiesLength;
-    UCHAR  RawDeviceProperties[1];
-} STORAGE_DEVICE_DESCRIPTOR, *PSTORAGE_DEVICE_DESCRIPTOR;
-#pragma pack(pop)
-
 // ── ATA IDENTIFY passthrough layout ──────────────────────────────────────────
 
 #pragma pack(push, 1)
-typedef struct _ATA_PASS_THROUGH_EX {
-    USHORT Length;
-    USHORT AtaFlags;
-    UCHAR  PathId;
-    UCHAR  TargetId;
-    UCHAR  Lun;
-    UCHAR  ReservedAsUchar;
-    ULONG  DataTransferLength;
-    ULONG  TimeOutValue;
-    ULONG  ReservedAsUlong;
-    LARGE_INTEGER DataBufferOffset;
-    UCHAR  PreviousTaskFile[8];
-    UCHAR  CurrentTaskFile[8];
-} ATA_PASS_THROUGH_EX, *PATA_PASS_THROUGH_EX;
-
 typedef struct _ATA_IDENTIFY_DEVICE_DATA {
     USHORT Reserved1[10];
-    CHAR   SerialNumber[20];   // words 10-19, byte-swapped per word
+    CHAR   SerialNumber[20];
     USHORT Reserved2[3];
     CHAR   FirmwareRevision[8];
     CHAR   ModelNumber[40];
     USHORT Reserved3[13];
-    // ... rest of identify data
 } ATA_IDENTIFY_DEVICE_DATA, *PATA_IDENTIFY_DEVICE_DATA;
 #pragma pack(pop)
 
 // ── per-disk filter context ───────────────────────────────────────────────────
 
 typedef struct _DISK_FILTER_CTX {
-    PDEVICE_OBJECT FilterDevice;          // our filter device (for DriverUnload)
+    PDEVICE_OBJECT FilterDevice;
     PDEVICE_OBJECT LowerDevice;
-    CHAR           SpoofedSerial[24];     // plain ascii — STORAGE_QUERY_PROPERTY / SCSI VPD
-    CHAR           SpoofedSerialAta[20];  // byte-swapped per word — ATA IDENTIFY (words 10-19)
-    BOOL           Active;
+    CHAR           SpoofedSerial[24];
+    CHAR           SpoofedSerialAta[20];
+    BOOLEAN        Active;
 } DISK_FILTER_CTX, *PDISK_FILTER_CTX;
 
 static DISK_FILTER_CTX g_Disks[MAX_DISKS];
@@ -181,7 +100,7 @@ static ULONG g_Seed = 0;
 
 static VOID SeedRng(VOID) {
     LARGE_INTEGER t;
-    KeQuerySystemTime(&t);
+    KeQuerySystemTimePrecise(&t);
     g_Seed = (ULONG)(t.QuadPart ^ (t.QuadPart >> 32));
     if (g_Seed == 0) g_Seed = 0xBAADF00D;
 }
@@ -195,7 +114,6 @@ static ULONG RandU32K(VOID) {
 
 static UCHAR RandByteK(VOID) { return (UCHAR)(RandU32K() & 0xFF); }
 
-// generate N-char alphanumeric serial into buf (null-terminated)
 static VOID MakeSerial(PCHAR buf, SIZE_T len) {
     static const CHAR table[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     SIZE_T i;
@@ -204,18 +122,15 @@ static VOID MakeSerial(PCHAR buf, SIZE_T len) {
     buf[len - 1] = '\0';
 }
 
-// ATA serials are byte-swapped per word
 static VOID MakeAtaSerial(PCHAR buf, SIZE_T len) {
     CHAR tmp[21] = { 0 };
     SIZE_T fill = len > 20 ? 20 : len;
     MakeSerial(tmp, fill + 1);
-    // byte-swap within each 2-byte word
     for (SIZE_T i = 0; i + 1 < fill; i += 2) {
         buf[i]     = tmp[i + 1];
         buf[i + 1] = tmp[i];
     }
     if (fill & 1) buf[fill - 1] = ' ';
-    // pad with spaces (ATA spec)
     for (SIZE_T i = fill; i < 20; i++) buf[i] = ' ';
 }
 
@@ -231,7 +146,6 @@ static VOID PatchStorageDescriptor(PUCHAR buf, ULONG bufLen,
     PCHAR serial = (PCHAR)(buf + desc->SerialNumberOffset);
     ULONG maxLen = bufLen - desc->SerialNumberOffset;
 
-    // copy our precomputed serial
     SIZE_T copyLen = min(maxLen - 1, (ULONG)(sizeof(ctx->SpoofedSerial) - 1));
     RtlCopyMemory(serial, ctx->SpoofedSerial, copyLen);
     serial[copyLen] = '\0';
@@ -258,7 +172,6 @@ static NTSTATUS OnIoCompletion(PDEVICE_OBJECT DevObj,
         if (code == IOCTL_STORAGE_QUERY_PROPERTY)
             PatchStorageDescriptor(outBuf, outLen, ctx);
 
-        // ATA PASS THROUGH — patch word 10-19 (serial in IDENTIFY response)
         if (code == IOCTL_ATA_PASS_THROUGH) {
             if (outLen >= sizeof(ATA_PASS_THROUGH_EX) + 512) {
                 PATA_PASS_THROUGH_EX apt = (PATA_PASS_THROUGH_EX)outBuf;
@@ -267,21 +180,18 @@ static NTSTATUS OnIoCompletion(PDEVICE_OBJECT DevObj,
                     dbo + 512 <= (LONGLONG)outLen) {
                     PATA_IDENTIFY_DEVICE_DATA id =
                         (PATA_IDENTIFY_DEVICE_DATA)(outBuf + dbo);
-                    // use precomputed per-disk byte-swapped serial for consistency
                     RtlCopyMemory(id->SerialNumber, ctx->SpoofedSerialAta, 20);
                 }
             }
         }
 
-        // SCSI PASS THROUGH — VPD page 0x80 (unit serial number)
-        // EAC secondary path: INQUIRY EVPD=1, page 0x80
         if (code == IOCTL_SCSI_PASS_THROUGH &&
             outLen > sizeof(SCSI_PASS_THROUGH)) {
             PSCSI_PASS_THROUGH spt = (PSCSI_PASS_THROUGH)outBuf;
             if (spt->CdbLength >= 4      &&
-                spt->Cdb[0]  == 0x12     &&   // INQUIRY
-                (spt->Cdb[1] & 0x01)     &&   // EVPD
-                spt->Cdb[2]  == 0x80     &&   // serial number VPD page
+                spt->Cdb[0]  == 0x12     &&
+                (spt->Cdb[1] & 0x01)     &&
+                spt->Cdb[2]  == 0x80     &&
                 spt->DataBufferOffset > 0 &&
                 spt->DataTransferLength  >= 5)
             {
@@ -291,7 +201,6 @@ static NTSTATUS OnIoCompletion(PDEVICE_OBJECT DevObj,
                     ULONG  pgLen  = data[3];
                     ULONG  avail  = (ULONG)(outLen - dbo - 4);
                     if (pgLen > 0 && pgLen <= avail && pgLen < 24) {
-                        // use per-disk stored serial for cross-path consistency
                         ULONG copyLen = min(pgLen,
                             (ULONG)(sizeof(ctx->SpoofedSerial) - 1));
                         RtlCopyMemory(data + 4, ctx->SpoofedSerial, copyLen);
@@ -314,10 +223,8 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp) {
     ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
 
     if (code == IOCTL_STORAGE_QUERY_PROPERTY ||
-        code == IOCTL_ATA_PASS_THROUGH        ||  // METHOD_BUFFERED — safe to patch in completion
+        code == IOCTL_ATA_PASS_THROUGH        ||
         code == IOCTL_SCSI_PASS_THROUGH) {
-        // IOCTL_ATA_PASS_THROUGH_DIRECT uses METHOD_NEITHER; its output lives in
-        // Irp->UserBuffer (user address), not SystemBuffer — skip to avoid fault.
         IoCopyCurrentIrpStackLocationToNext(Irp);
         IoSetCompletionRoutine(Irp, OnIoCompletion, ctx, TRUE, TRUE, TRUE);
         return IoCallDriver(ctx->LowerDevice, Irp);
@@ -337,12 +244,10 @@ static NTSTATUS DispatchPassthrough(PDEVICE_OBJECT DevObj, PIRP Irp) {
 
 // ── SMBIOS patch ──────────────────────────────────────────────────────────────
 
-// Walk and patch Type1 UUID + Type2 baseboard serial in an SMBIOS structure
-// table at buf[0..len).  Returns TRUE if at least one structure was patched.
-static BOOL PatchSmbiosStructures(PUCHAR buf, ULONG len) {
+static BOOLEAN PatchSmbiosStructures(PUCHAR buf, ULONG len) {
     PUCHAR cur = buf;
     PUCHAR end = buf + len;
-    BOOL   p1  = FALSE, p2 = FALSE;
+    BOOLEAN p1 = FALSE, p2 = FALSE;
 
     while (cur + sizeof(SMBIOS_HEADER) < end) {
         PSMBIOS_HEADER hdr = (PSMBIOS_HEADER)cur;
@@ -370,7 +275,9 @@ static BOOL PatchSmbiosStructures(PUCHAR buf, ULONG len) {
                 s++; idx++;
             }
             if (s < strEnd && *s) {
-                SIZE_T origLen = strnlen(s, (SIZE_T)(strEnd - s));
+                // kernel-safe strlen bounded by strEnd
+                SIZE_T origLen = 0;
+                while (origLen < (SIZE_T)(strEnd - s) && s[origLen]) origLen++;
                 if (origLen > 0) {
                     CHAR newSer[24] = { 0 };
                     MakeSerial(newSer, min(origLen + 1, sizeof(newSer)));
@@ -391,9 +298,7 @@ static BOOL PatchSmbiosStructures(PUCHAR buf, ULONG len) {
     return (p1 || p2);
 }
 
-// Legacy path: physical scan at 0xF0000 (BIOS / CSM / most OEM UEFI).
-// Returns TRUE if entry point found and table patched.
-static BOOL PatchSmbios(VOID) {
+static BOOLEAN PatchSmbios(VOID) {
     const PHYSICAL_ADDRESS phyStart = { 0xF0000, 0 };
     const SIZE_T           scanSize  = 0x10000;
 
@@ -421,17 +326,13 @@ static BOOL PatchSmbios(VOID) {
     PVOID table = MmMapIoSpace(tblPhys, tblLen + 8, MmNonCached);
     if (!table) { KdPrint(("[spo] SMBIOS legacy: table map failed\n")); return FALSE; }
 
-    BOOL ok = PatchSmbiosStructures((PUCHAR)table, tblLen);
+    BOOLEAN ok = PatchSmbiosStructures((PUCHAR)table, tblLen);
     MmUnmapIoSpace(table, tblLen + 8);
     if (ok) KdPrint(("[spo] SMBIOS legacy: OK\n"));
     return ok;
 }
 
-// UEFI path: ZwQuerySystemInformation('RSMB') returns the live kernel cache.
-// We use the Type1 UUID as a fingerprint, then scan physical memory ranges
-// (≤ 4 GB) for the matching bytes and patch the firmware table in place.
 static VOID PatchSmbiosUefi(VOID) {
-    // ── step 1: get raw SMBIOS bytes from kernel ──────────────────────────────
     const ULONG initSz = sizeof(SYSTEM_FIRMWARE_TABLE_INFORMATION) + 0x8000;
     PSYSTEM_FIRMWARE_TABLE_INFORMATION sfti =
         (PSYSTEM_FIRMWARE_TABLE_INFORMATION)ExAllocatePoolWithTag(
@@ -446,7 +347,8 @@ static VOID PatchSmbiosUefi(VOID) {
 
     ULONG    needed = 0;
     NTSTATUS st = ZwQuerySystemInformation(
-        SystemFirmwareTableInformation, sfti, initSz, &needed);
+        (SYSTEM_INFORMATION_CLASS)SystemFirmwareTableInformation,
+        sfti, initSz, &needed);
 
     if (st == STATUS_BUFFER_TOO_SMALL && needed) {
         ExFreePoolWithTag(sfti, POOL_TAG);
@@ -459,7 +361,8 @@ static VOID PatchSmbiosUefi(VOID) {
         sfti->TableBufferLength = needed -
             FIELD_OFFSET(SYSTEM_FIRMWARE_TABLE_INFORMATION, TableBuffer);
         st = ZwQuerySystemInformation(
-            SystemFirmwareTableInformation, sfti, needed, &needed);
+            (SYSTEM_INFORMATION_CLASS)SystemFirmwareTableInformation,
+            sfti, needed, &needed);
     }
 
     if (!NT_SUCCESS(st) || sfti->TableBufferLength < 9) {
@@ -468,15 +371,13 @@ static VOID PatchSmbiosUefi(VOID) {
         return;
     }
 
-    // RSMB raw layout: 1+1+1+1 (method/maj/min/dmi) + DWORD length + data
     ULONG  smbLen  = *(ULONG*)(sfti->TableBuffer + 4);
     PUCHAR smbData = sfti->TableBuffer + 8;
     if (smbLen + 8 > sfti->TableBufferLength)
         smbLen = sfti->TableBufferLength - 8;
 
-    // ── step 2: extract Type1 UUID as fingerprint ────────────────────────────
-    UCHAR  uuid[16] = { 0 };
-    BOOL   gotUuid  = FALSE;
+    UCHAR   uuid[16] = { 0 };
+    BOOLEAN gotUuid  = FALSE;
     PUCHAR c = smbData, e = smbData + smbLen;
     while (c + sizeof(SMBIOS_HEADER) < e && !gotUuid) {
         PSMBIOS_HEADER h = (PSMBIOS_HEADER)c;
@@ -496,15 +397,14 @@ static VOID PatchSmbiosUefi(VOID) {
 
     if (!gotUuid) { KdPrint(("[spo] RSMB UEFI: no Type1\n")); return; }
 
-    // ── step 3: scan physical ranges ≤ 4 GB for the UUID fingerprint ─────────
     PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
     if (!ranges) return;
 
-    BOOL patched = FALSE;
+    BOOLEAN patched = FALSE;
     for (int r = 0; ranges[r].NumberOfBytes.QuadPart != 0 && !patched; r++) {
         ULONG64 base = (ULONG64)ranges[r].BaseAddress.QuadPart;
         ULONG64 span = (ULONG64)ranges[r].NumberOfBytes.QuadPart;
-        if (base >= 0x100000000ULL) continue;               // above 4 GB — skip
+        if (base >= 0x100000000ULL) continue;
         if (base + span > 0x100000000ULL)
             span = 0x100000000ULL - base;
 
@@ -624,12 +524,10 @@ EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject,
 
     DriverObject->DriverUnload = DriverUnload;
 
-    // wire dispatch table
     for (int i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
         DriverObject->MajorFunction[i] = DispatchPassthrough;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
 
-    // attach to physical disks 0..7
     int attached = 0;
     for (ULONG i = 0; i < MAX_DISKS; i++) {
         if (NT_SUCCESS(AttachDiskFilter(DriverObject, i)))
@@ -637,7 +535,6 @@ EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject,
     }
     KdPrint(("[spo] disk filters: %d attached\n", attached));
 
-    // patch SMBIOS — legacy path first (BIOS/CSM), UEFI fallback if not found
     if (!PatchSmbios())
         PatchSmbiosUefi();
 
