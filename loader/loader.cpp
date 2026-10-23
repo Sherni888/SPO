@@ -22,8 +22,6 @@
 //   loader.exe --load spo_drv.sys --scm                  SCM (signed/test-sign)
 //   loader.exe --unload
 //   loader.exe --status
-//   loader.exe --install   [--vuln iqvw64e.sys]          persist via schtask
-//   loader.exe --uninstall                               remove schtask
 
 #include <windows.h>
 #include <winternl.h>

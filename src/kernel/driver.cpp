@@ -429,7 +429,7 @@ static BOOL PatchSmbios(VOID) {
 
 // UEFI path: ZwQuerySystemInformation('RSMB') returns the live kernel cache.
 // We use the Type1 UUID as a fingerprint, then scan physical memory ranges
-// (<= 4 GB) for the matching bytes and patch the firmware table in place.
+// (≤ 4 GB) for the matching bytes and patch the firmware table in place.
 static VOID PatchSmbiosUefi(VOID) {
     // ── step 1: get raw SMBIOS bytes from kernel ──────────────────────────────
     const ULONG initSz = sizeof(SYSTEM_FIRMWARE_TABLE_INFORMATION) + 0x8000;
@@ -496,7 +496,7 @@ static VOID PatchSmbiosUefi(VOID) {
 
     if (!gotUuid) { KdPrint(("[spo] RSMB UEFI: no Type1\n")); return; }
 
-    // ── step 3: scan physical ranges <= 4 GB for the UUID fingerprint ─────────
+    // ── step 3: scan physical ranges ≤ 4 GB for the UUID fingerprint ─────────
     PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
     if (!ranges) return;
 
