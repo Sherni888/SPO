@@ -1,0 +1,55 @@
+name: Build SPO
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # WDK 11 (26100) — installs VS extension for WindowsKernelModeDriver10.0 toolset
+      - name: Install WDK
+        shell: powershell
+        run: |
+          choco install windowsdriverkit11 --yes --no-progress
+          # Reload PATH so msbuild can find WDK props
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
+                      [System.Environment]::GetEnvironmentVariable("Path","User")
+
+      # ── usermode: spo.exe + loader.exe via CMake ──────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -S build -B build/out -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build usermode
+        run: cmake --build build/out --config Release --parallel
+
+      # ── kernel driver: spo_drv.sys via MSBuild + WDK ─────────────────────
+      - name: Build kernel driver
+        run: |
+          msbuild build\kernel\spo_drv.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:OutDir=${{ github.workspace }}\build\out\bin\Release\ `
+            /m /nologo /v:minimal
+
+      # ── collect artifacts ─────────────────────────────────────────────────
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spo-release-x64
+          path: |
+            build/out/bin/Release/spo.exe
+            build/out/bin/Release/loader.exe
+            build/out/bin/Release/spo_drv.sys
+          if-no-files-found: error
+          retention-days: 30
