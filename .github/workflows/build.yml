@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -20,7 +23,6 @@ jobs:
         shell: powershell
         run: |
           choco install windowsdriverkit11 --yes --no-progress
-          # Reload PATH so msbuild can find WDK props
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
                       [System.Environment]::GetEnvironmentVariable("Path","User")
 
@@ -42,14 +44,37 @@ jobs:
             /p:OutDir=${{ github.workspace }}\build\out\bin\Release\ `
             /m /nologo /v:minimal
 
-      # ── collect artifacts ─────────────────────────────────────────────────
-      - name: Upload artifacts
+      # ── zip artifacts ───────────────────────────────────────────────────────
+      - name: Package release
+        shell: powershell
+        run: |
+          $out = "build\out\bin\Release"
+          Compress-Archive -Path "$out\spo.exe","$out\loader.exe","$out\spo_drv.sys" `
+            -DestinationPath "spo-release-x64.zip" -Force
+
+      # ── upload artifact (always) ──────────────────────────────────────────────
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: spo-release-x64
-          path: |
-            build/out/bin/Release/spo.exe
-            build/out/bin/Release/loader.exe
-            build/out/bin/Release/spo_drv.sys
-          if-no-files-found: error
+          path: spo-release-x64.zip
           retention-days: 30
+
+      # ── publish GitHub Release ────────────────────────────────────────────────
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "SPO build ${{ github.run_number }}"
+          body: |
+            Automated release from branch `${{ github.ref_name }}` — commit `${{ github.sha }}`
+
+            **Contents:**
+            - `spo.exe` — usermode spoofer (registry, NIC, EDID, GPU)
+            - `loader.exe` — kernel driver loader via iqvw64e.sys primitive
+            - `spo_drv.sys` — kernel filter driver (disk serial + SMBIOS UUID)
+
+            **Usage:** see README
+          files: spo-release-x64.zip
+          draft: false
+          prerelease: false
