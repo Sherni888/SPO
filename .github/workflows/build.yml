@@ -1,0 +1,117 @@
+name: Build SPO
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      # WDK 11 (26100) — installs VS extension for WindowsKernelModeDriver10.0 toolset
+      - name: Install WDK
+        shell: powershell
+        run: |
+          choco install windowsdriverkit11 --yes --no-progress
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + `
+                      [System.Environment]::GetEnvironmentVariable("Path","User")
+
+      # ── usermode: spo.exe + loader.exe via CMake ──────────────────────────────
+      - name: Configure CMake
+        run: |
+          cmake -S build -B build/out -G "Visual Studio 18 2026" -A x64 `
+                -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build usermode
+        run: cmake --build build/out --config Release --parallel
+
+      # ── kernel driver: spo_drv.sys via cl.exe + link.exe directly ────────
+      # WDK toolset include paths don't propagate reliably via msbuild on CI;
+      # invoke compiler directly with explicit /I paths found at runtime.
+      - name: Build kernel driver
+        shell: powershell
+        run: |
+          $kitsBase = "C:\Program Files (x86)\Windows Kits\10"
+          $wdkVer   = (Get-ChildItem "$kitsBase\Include" |
+                        Where-Object { $_.Name -match '^\d+\.\d+' } |
+                        Sort-Object Name -Descending |
+                        Select-Object -First 1).Name
+          if (-not $wdkVer) { Write-Error "WDK versioned Include dir not found under $kitsBase\Include"; exit 1 }
+          Write-Host "WDK version: $wdkVer"
+
+          $kmInc     = "$kitsBase\Include\$wdkVer\km"
+          $sharedInc = "$kitsBase\Include\$wdkVer\shared"
+          $kmLib     = "$kitsBase\Lib\$wdkVer\km\x64"
+
+          $msvcBase = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC"
+          $msvcVer  = (Get-ChildItem $msvcBase | Sort-Object Name -Descending | Select-Object -First 1).Name
+          $cl       = "$msvcBase\$msvcVer\bin\Hostx64\x64\cl.exe"
+          $link     = "$msvcBase\$msvcVer\bin\Hostx64\x64\link.exe"
+
+          $outDir = "$env:GITHUB_WORKSPACE\build\out\bin\Release"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          Write-Host "cl: $cl"
+          Write-Host "kmInc: $kmInc"
+          Write-Host "kmLib: $kmLib"
+
+          & $cl /nologo /c /W3 /WX- /O2 /GS- /Gz `
+              /D_AMD64_ /DAMD64 /D_WIN64 /DNTDDI_VERSION=0x0A000000 `
+              /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DWINNT=1 `
+              /I"$kmInc" /I"$sharedInc" `
+              /Fo"$outDir\driver.obj" `
+              "src\kernel\driver.cpp"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $link /nologo /DRIVER /BASE:0x10000 /ALIGN:0x1000 /NODEFAULTLIB `
+              /SUBSYSTEM:NATIVE /ENTRY:DriverEntry /MACHINE:X64 `
+              /OPT:REF /OPT:ICF `
+              /OUT:"$outDir\spo_drv.sys" `
+              "$outDir\driver.obj" `
+              /LIBPATH:"$kmLib" ntoskrnl.lib hal.lib wdm.lib ntstrsafe.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ── zip artifacts ───────────────────────────────────────────────────────
+      - name: Package release
+        shell: powershell
+        run: |
+          $out = "build\out\bin\Release"
+          Compress-Archive -Path "$out\spo.exe","$out\loader.exe","$out\spo_drv.sys" `
+            -DestinationPath "spo-release-x64.zip" -Force
+
+      # ── upload artifact (always) ──────────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spo-release-x64
+          path: spo-release-x64.zip
+          retention-days: 30
+
+      # ── publish GitHub Release ────────────────────────────────────────────────
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: "SPO build ${{ github.run_number }}"
+          body: |
+            Automated release from branch `${{ github.ref_name }}` — commit `${{ github.sha }}`
+
+            **Contents:**
+            - `spo.exe` — usermode spoofer (registry, NIC, EDID, GPU)
+            - `loader.exe` — kernel driver loader via iqvw64e.sys primitive
+            - `spo_drv.sys` — kernel filter driver (disk serial + SMBIOS UUID)
+
+            **Usage:** see README
+          files: spo-release-x64.zip
+          draft: false
+          prerelease: false
