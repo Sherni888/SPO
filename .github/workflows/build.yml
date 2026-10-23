@@ -52,12 +52,13 @@ jobs:
           $kmInc     = "$kitsBase\Include\$wdkVer\km"
           $kmLib     = "$kitsBase\Lib\$wdkVer\km\x64"
 
-          # shared headers from the highest SDK version on the runner (base image SDK is complete)
+          # shared/ucrt headers from the highest SDK version on the runner (base image SDK is complete)
           $sdkVer    = (Get-ChildItem "$kitsBase\Include" |
                          Where-Object { $_.Name -match '^\d+\.\d+' } |
                          Sort-Object Name -Descending |
                          Select-Object -First 1).Name
           $sharedInc = "$kitsBase\Include\$sdkVer\shared"
+          $ucrtInc   = "$kitsBase\Include\$sdkVer\ucrt"
 
           $msvcBase = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC"
           $msvcVer  = (Get-ChildItem $msvcBase | Sort-Object Name -Descending | Select-Object -First 1).Name
@@ -74,14 +75,15 @@ jobs:
           Write-Host "msvcInc:   $msvcInc"
           Write-Host "kmLib:     $kmLib"
           Write-Host "ntdef.h exists: $(Test-Path "$sharedInc\ntdef.h")"
+          Write-Host "ctype.h exists: $(Test-Path "$ucrtInc\ctype.h")"
 
           # Set INCLUDE env var — more reliable for deep include chains than /I alone
-          $env:INCLUDE = "$msvcInc;$kmInc;$sharedInc"
+          $env:INCLUDE = "$msvcInc;$kmInc;$sharedInc;$ucrtInc"
 
           & $cl /nologo /c /W3 /WX- /O2 /GS- /Gz `
               /D_AMD64_ /DAMD64 /D_WIN64 /DNTDDI_VERSION=0x0A000000 `
               /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /DWINNT=1 `
-              /I"$kmInc" /I"$sharedInc" /I"$msvcInc" `
+              /I"$kmInc" /I"$sharedInc" /I"$ucrtInc" /I"$msvcInc" `
               /Fo"$outDir\driver.obj" `
               "src\kernel\driver.cpp"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
